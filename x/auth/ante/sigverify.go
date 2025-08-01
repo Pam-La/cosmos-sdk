@@ -516,7 +516,10 @@ func (isd IncrementSequenceDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, sim
 
 	for _, signer := range signers {
 		acc := isd.ak.GetAccount(ctx, signer)
-		if err := acc.SetSequence(acc.GetSequence() + 1); err != nil {
+		oldSeq := acc.GetSequence()
+		newSeq := oldSeq + 1
+
+		if err := acc.SetSequence(newSeq); err != nil {
 			panic(err)
 		}
 

@@ -34,6 +34,25 @@ type Store struct {
 
 var _ types.CacheKVStore = (*Store)(nil)
 
+// DirtyKeys returns the set of keys that were modified (Set/Delete) in this cache.
+// It is used by parallel transaction execution to detect write-set conflicts.
+func (store *Store) DirtyKeys() [][]byte {
+	store.mtx.Lock()
+	defer store.mtx.Unlock()
+
+	keys := make([][]byte, 0, len(store.cache)+len(store.unsortedCache))
+	for k, cv := range store.cache {
+		if cv.dirty {
+			keys = append(keys, []byte(k))
+		}
+	}
+	for k := range store.unsortedCache {
+		// unsortedCache keys are always dirty
+		keys = append(keys, []byte(k))
+	}
+	return keys
+}
+
 // NewStore creates a new Store object
 func NewStore(parent types.KVStore) *Store {
 	return &Store{

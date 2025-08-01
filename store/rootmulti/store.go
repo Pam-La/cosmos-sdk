@@ -509,10 +509,12 @@ func (rs *Store) Commit() types.CommitID {
 		)
 	}
 
-	return types.CommitID{
+	finalCommitID := types.CommitID{
 		Version: version,
 		Hash:    rs.lastCommitInfo.Hash(),
 	}
+
+	return finalCommitID
 }
 
 // WorkingHash returns the current hash of the store.

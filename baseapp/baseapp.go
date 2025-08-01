@@ -2,6 +2,7 @@ package baseapp
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"maps"
 	"math"
@@ -9,6 +10,8 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+
+	cachemultistore "cosmossdk.io/store/cachemulti"
 
 	"github.com/cockroachdb/errors"
 	abci "github.com/cometbft/cometbft/abci/types"
@@ -812,7 +815,7 @@ func (app *BaseApp) deliverBatchTx(txs [][]byte) []*abci.ExecTxResult {
 	resultStr := "successful"
 	usedGas, wantedGas := uint64(0), uint64(0)
 
-	var resps []*abci.ExecTxResult
+	resps := make([]*abci.ExecTxResult, batchSize)
 
 	defer func() {
 		telemetry.IncrCounter(float32(batchSize), "tx", "count")
@@ -825,7 +828,7 @@ func (app *BaseApp) deliverBatchTx(txs [][]byte) []*abci.ExecTxResult {
 	if err != nil {
 		resultStr = "failed"
 		resps = make([]*abci.ExecTxResult, batchSize)
-		for i := range batchSize {
+		for i := 0; i < batchSize; i++ {
 			resps[i] = sdkerrors.ResponseExecTxResultWithEvents(
 				err,
 				0,   // GasWanted
@@ -837,7 +840,7 @@ func (app *BaseApp) deliverBatchTx(txs [][]byte) []*abci.ExecTxResult {
 		return resps
 	}
 
-	for i := range batchSize {
+	for i := 0; i < batchSize; i++ {
 		usedGas += gInfos[i].GasUsed
 		wantedGas += gInfos[i].GasWanted
 
@@ -848,7 +851,7 @@ func (app *BaseApp) deliverBatchTx(txs [][]byte) []*abci.ExecTxResult {
 			Data:      results[i].Data,
 			Events:    sdk.MarkEventsToIndex(results[i].Events, app.indexEvents),
 		}
-		resps = append(resps, resp)
+		resps[i] = resp
 	}
 
 	return resps
@@ -1075,16 +1078,18 @@ func (app *BaseApp) runTx(mode execMode, txBytes []byte, tx sdk.Tx) (gInfo sdk.G
 
 // TxExecutionResult holds the result of executing a single transaction in parallel
 type TxExecutionResult struct {
-	Index      int                        // 트랜잭션 인덱스
-	TxBytes    []byte                     // 원본 트랜잭션 바이트
-	Tx         sdk.Tx                     // 디코딩된 트랜잭션
-	GasInfo    sdk.GasInfo                // 가스 정보
-	Result     *sdk.Result                // 실행 결과
-	AnteEvents []abci.Event               // AnteHandler 이벤트
-	RunMsgCtx  sdk.Context                // 메시지 실행 컨텍스트
-	MsCache    storetypes.CacheMultiStore // 캐시된 멀티스토어
-	Error      error                      // 실행 에러
-	GasWanted  uint64                     // 요청된 가스
+	Index       int                        // 트랜잭션 인덱스
+	TxBytes     []byte                     // 원본 트랜잭션 바이트
+	Tx          sdk.Tx                     // 디코딩된 트랜잭션
+	GasInfo     sdk.GasInfo                // 가스 정보
+	Result      *sdk.Result                // 실행 결과
+	AnteEvents  []abci.Event               // AnteHandler 이벤트
+	RunMsgCtx   sdk.Context                // 메시지 실행 컨텍스트
+	AnteMsCache storetypes.CacheMultiStore // AnteHandler 캐시 스토어
+	MsCache     storetypes.CacheMultiStore // 메시지 실행 캐시 스토어
+	WriteSet    map[string]struct{}        // 수정된 키 집합 (store|key)
+	Error       error                      // 실행 에러
+	GasWanted   uint64                     // 요청된 가스
 }
 
 func (app *BaseApp) runBatchTx(mode execMode, txs [][]byte) (gInfos []sdk.GasInfo, results []*sdk.Result, err error) {
@@ -1093,193 +1098,260 @@ func (app *BaseApp) runBatchTx(mode execMode, txs [][]byte) (gInfos []sdk.GasInf
 		return []sdk.GasInfo{}, []*sdk.Result{}, nil
 	}
 
-	var baseCtx sdk.Context
-	if mode == execModeFinalize {
-		baseCtx = app.finalizeBlockState.Context()
-	} else {
-		baseCtx = app.getContextForTx(mode, nil)
-	}
+	baseCtx := app.getContextForTx(mode, nil)
 	ms := baseCtx.MultiStore()
 
-	// 병렬 실행 결과를 저장
+	// 1) 트랜잭션을 병렬로 실행하여 결과 수집
 	txResults := make([]*TxExecutionResult, batchSize)
 	var wg sync.WaitGroup
-
-	// 2. 각 트랜잭션을 병렬로 실행 (write하지 않음)
 	for i, txBytes := range txs {
 		wg.Add(1)
-		go func(index int, txBytes []byte) {
+		go func(idx int, bz []byte) {
 			defer wg.Done()
-
-			result := &TxExecutionResult{
-				Index:   index,
-				TxBytes: txBytes,
-			}
-
-			defer func() {
-				if r := recover(); r != nil {
-					result.Error = fmt.Errorf("panic in parallel tx execution: %v", r)
-				}
-				txResults[index] = result
-			}()
-
-			tx, err := app.txDecoder(txBytes)
-			if err != nil {
-				result.Error = sdkerrors.ErrTxDecode.Wrap(err.Error())
-				return
-			}
-			result.Tx = tx
-
-			if mode == execModeFinalize && baseCtx.BlockGasMeter().IsOutOfGas() {
-				result.Error = errorsmod.Wrap(sdkerrors.ErrOutOfGas, "no block gas left to run tx")
-				return
-			}
-
-			// baseCtx 기반으로 독립 트랜잭션 컨텍스트 생성
-			ctx := baseCtx.WithTxBytes(txBytes).
-				WithGasMeter(storetypes.NewInfiniteGasMeter()).
-				WithIsSigverifyTx(app.sigverifyTx).
-				WithConsensusParams(app.GetConsensusParams(baseCtx))
-
-			if mode == execModeReCheck {
-				ctx = ctx.WithIsReCheckTx(true)
-			}
-			if mode == execModeSimulate {
-				ctx, _ = ctx.CacheContext()
-				ctx = ctx.WithExecMode(sdk.ExecMode(execModeSimulate))
-			}
-
-			var gasWanted uint64
-
-			msgs := tx.GetMsgs()
-			if err := validateBasicTxMsgs(msgs); err != nil {
-				result.Error = err
-				return
-			}
-
-			for _, msg := range msgs {
-				handler := app.msgServiceRouter.Handler(msg)
-				if handler == nil {
-					result.Error = errorsmod.Wrapf(sdkerrors.ErrUnknownRequest, "no message handler found for %T", msg)
-					return
-				}
-			}
-
-			var anteEvents []abci.Event
-			if app.anteHandler != nil {
-				anteCtx, anteMsCache := app.cacheTxContext(ctx, txBytes)
-				anteCtx = anteCtx.WithEventManager(sdk.NewEventManager())
-
-				newCtx, err := app.anteHandler(anteCtx, tx, mode == execModeSimulate)
-				if !newCtx.IsZero() {
-					ctx = newCtx.WithMultiStore(ms)
-				}
-
-				gasWanted = ctx.GasMeter().Limit()
-				if err != nil {
-					result.Error = err
-					result.GasInfo = sdk.GasInfo{GasWanted: gasWanted, GasUsed: ctx.GasMeter().GasConsumed()}
-					return
-				}
-
-				anteMsCache.Write()
-				events := anteCtx.EventManager().Events()
-				anteEvents = events.ToABCIEvents()
-			}
-
-			// 3. runMsgCtx 생성 (write하지 않음)
-			runMsgCtx, msCache := app.cacheTxContext(ctx, txBytes)
-
-			msgsV2, err := tx.GetMsgsV2()
-			var msgResult *sdk.Result
-			if err == nil {
-				msgResult, err = app.runMsgs(runMsgCtx, msgs, msgsV2, mode)
-			}
-
-			if app.postHandler != nil && err == nil {
-				postCtx := runMsgCtx.WithEventManager(sdk.NewEventManager())
-				newCtx, errPostHandler := app.postHandler(postCtx, tx, mode == execModeSimulate, err == nil)
-				if errPostHandler != nil {
-					result.Error = errPostHandler
-					return
-				}
-				if msgResult == nil {
-					msgResult = &sdk.Result{}
-				}
-				msgResult.Events = append(msgResult.Events, newCtx.EventManager().ABCIEvents()...)
-			}
-
-			// 결과 저장 (write는 하지 않음)
-			result.GasWanted = gasWanted
-			result.GasInfo = sdk.GasInfo{GasWanted: gasWanted, GasUsed: ctx.GasMeter().GasConsumed()}
-			result.Result = msgResult
-			result.AnteEvents = anteEvents
-			result.RunMsgCtx = runMsgCtx
-			result.MsCache = msCache
-			result.Error = err
+			txResults[idx] = app.executeTxInBatch(baseCtx, ms, mode, idx, bz)
 		}(i, txBytes)
 	}
-
-	// 모든 고루틴 완료 대기
 	wg.Wait()
 
-	// 트랜잭션 인덱스 순으로 정렬
-	sort.Slice(txResults, func(i, j int) bool {
-		return txResults[i].Index < txResults[j].Index
-	})
+	// 인덱스 기준 정렬 (고루틴 실행 순서 보장)
+	sort.Slice(txResults, func(i, j int) bool { return txResults[i].Index < txResults[j].Index })
 
-	// 4. 순차적으로 write 및 결과 취합
-	gInfos = make([]sdk.GasInfo, batchSize)
-	results = make([]*sdk.Result, batchSize)
+	// 2) 순차적으로 결과 커밋 및 gInfo/result 구성
+	return app.commitBatchResults(mode, baseCtx, txResults)
+}
+
+// executeTxInBatch runs a single transaction within a batch context.
+// 실제 실행 로직은 기존 runBatchTx 고루틴 본문을 그대로 옮겼다.
+func (app *BaseApp) executeTxInBatch(
+	baseCtx sdk.Context,
+	ms storetypes.MultiStore,
+	mode execMode,
+	index int,
+	txBytes []byte,
+) *TxExecutionResult {
+	// NOTE: 기존 구현을 함수로 추출했을 뿐, 로직은 동일하다.
+	result := &TxExecutionResult{
+		Index:   index,
+		TxBytes: txBytes,
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			result.Error = fmt.Errorf("panic in parallel tx execution: %v", r)
+		}
+	}()
+
+	tx, err := app.txDecoder(txBytes)
+	if err != nil {
+		result.Error = sdkerrors.ErrTxDecode.Wrap(err.Error())
+		return result
+	}
+	result.Tx = tx
+
+	if mode == execModeFinalize && baseCtx.BlockGasMeter().IsOutOfGas() {
+		result.Error = errorsmod.Wrap(sdkerrors.ErrOutOfGas, "no block gas left to run tx")
+		return result
+	}
+
+	// baseCtx 기반으로 독립 트랜잭션 컨텍스트 생성
+	ctx := baseCtx.WithTxBytes(txBytes).
+		WithGasMeter(storetypes.NewInfiniteGasMeter()).
+		WithIsSigverifyTx(app.sigverifyTx).
+		WithConsensusParams(app.GetConsensusParams(baseCtx))
+
+	if mode == execModeReCheck {
+		ctx = ctx.WithIsReCheckTx(true)
+	}
+	if mode == execModeSimulate {
+		ctx, _ = ctx.CacheContext()
+		ctx = ctx.WithExecMode(sdk.ExecMode(execModeSimulate))
+	}
+
+	// --------------- 기존 anteHandler / msg 실행 로직 ---------------
+	var (
+		gasWanted  uint64
+		anteEvents []abci.Event
+	)
+
+	msgs := tx.GetMsgs()
+	if err := validateBasicTxMsgs(msgs); err != nil {
+		result.Error = err
+		return result
+	}
+
+	for _, msg := range msgs {
+		if handler := app.msgServiceRouter.Handler(msg); handler == nil {
+			result.Error = errorsmod.Wrapf(sdkerrors.ErrUnknownRequest, "no message handler found for %T", msg)
+			return result
+		}
+	}
+
+	if app.anteHandler != nil {
+		anteCtx, anteMsCache := app.cacheTxContext(ctx, txBytes)
+		anteCtx = anteCtx.WithEventManager(sdk.NewEventManager())
+
+		newCtx, err := app.anteHandler(anteCtx, tx, mode == execModeSimulate)
+		if !newCtx.IsZero() {
+			ctx = newCtx.WithMultiStore(ms)
+		}
+
+		gasWanted = ctx.GasMeter().Limit()
+		if err != nil {
+			result.Error = err
+			result.GasInfo = sdk.GasInfo{GasWanted: gasWanted, GasUsed: ctx.GasMeter().GasConsumed()}
+			return result
+		}
+
+		// ante 단계의 상태는 이후 순차 커밋 단계에서 Write()
+		result.AnteMsCache = anteMsCache
+		events := anteCtx.EventManager().Events()
+		anteEvents = events.ToABCIEvents()
+	}
+
+	// runMsgCtx 생성 (write하지 않음)
+	runMsgCtx, msCache := app.cacheTxContext(ctx, txBytes)
+
+	msgsV2, err := tx.GetMsgsV2()
+	var msgResult *sdk.Result
+	if err == nil {
+		msgResult, err = app.runMsgs(runMsgCtx, msgs, msgsV2, mode)
+	}
+
+	if app.postHandler != nil && err == nil {
+		postCtx := runMsgCtx.WithEventManager(sdk.NewEventManager())
+		newCtx, errPostHandler := app.postHandler(postCtx, tx, mode == execModeSimulate, err == nil)
+		if errPostHandler != nil {
+			result.Error = errPostHandler
+			return result
+		}
+		if msgResult == nil {
+			msgResult = &sdk.Result{}
+		}
+		msgResult.Events = append(msgResult.Events, newCtx.EventManager().ABCIEvents()...)
+	}
+
+	// 결과 저장 (write는 하지 않음)
+	result.GasWanted = gasWanted
+	result.GasInfo = sdk.GasInfo{GasWanted: gasWanted, GasUsed: ctx.GasMeter().GasConsumed()}
+	result.Result = msgResult
+	result.AnteEvents = anteEvents
+	result.RunMsgCtx = runMsgCtx
+	result.MsCache = msCache
+
+	ws := extractWriteSet(msCache)
+	if result.AnteMsCache != nil {
+		for k := range extractWriteSet(result.AnteMsCache) {
+			ws[k] = struct{}{}
+		}
+	}
+	result.WriteSet = ws
+	result.Error = err
+
+	return result
+}
+
+// commitBatchResults sequentially writes successful transaction changes and builds final gInfos/results.
+func (app *BaseApp) commitBatchResults(
+	mode execMode,
+	baseCtx sdk.Context,
+	txResults []*TxExecutionResult,
+) ([]sdk.GasInfo, []*sdk.Result, error) {
+	batchSize := len(txResults)
+	gInfos := make([]sdk.GasInfo, batchSize)
+	results := make([]*sdk.Result, batchSize)
+
+	processedWriteSet := make(map[string]struct{})
 
 	for _, txResult := range txResults {
-		index := txResult.Index
+		idx := txResult.Index
 
 		if txResult.Error != nil {
-			// 에러가 있는 경우
-			gInfos[index] = txResult.GasInfo
-			results[index] = &sdk.Result{}
+			gInfos[idx] = txResult.GasInfo
+			results[idx] = &sdk.Result{}
 			continue
 		}
 
+		// mempool 처리
 		switch mode {
 		case execModeCheck:
 			if err := app.mempool.Insert(txResult.RunMsgCtx, txResult.Tx); err != nil {
-				gInfos[index] = txResult.GasInfo
-				results[index] = &sdk.Result{}
+				gInfos[idx] = txResult.GasInfo
+				results[idx] = &sdk.Result{}
 				continue
 			}
 		case execModeFinalize:
 			if err := app.mempool.Remove(txResult.Tx); err != nil && !errors.Is(err, mempool.ErrTxNotFound) {
-				gInfos[index] = txResult.GasInfo
-				results[index] = &sdk.Result{}
+				gInfos[idx] = txResult.GasInfo
+				results[idx] = &sdk.Result{}
 				continue
 			}
 		}
 
-		// 성공한 경우에만 write
+		// write set 충돌 검사
+		if mode == execModeFinalize && hasConflict(txResult.WriteSet, processedWriteSet) {
+			gInfos[idx] = txResult.GasInfo
+			results[idx] = &sdk.Result{}
+			continue
+		}
+
+		// 성공한 경우에만 write 수행
 		if mode == execModeFinalize {
-			// 블록 가스 소비
 			baseCtx.BlockGasMeter().ConsumeGas(
 				txResult.RunMsgCtx.GasMeter().GasConsumedToLimit(), "block gas meter",
 			)
 
-			// 상태 write
+			if txResult.AnteMsCache != nil {
+				txResult.AnteMsCache.Write()
+			}
 			txResult.MsCache.Write()
 		}
 
-		// 이벤트 병합
+		// ante 이벤트 병합
 		if len(txResult.AnteEvents) > 0 && (mode == execModeFinalize || mode == execModeSimulate) {
 			if txResult.Result != nil {
 				txResult.Result.Events = append(txResult.AnteEvents, txResult.Result.Events...)
 			}
 		}
 
-		gInfos[index] = txResult.GasInfo
-		results[index] = txResult.Result
+		gInfos[idx] = txResult.GasInfo
+		results[idx] = txResult.Result
+
+		for k := range txResult.WriteSet {
+			processedWriteSet[k] = struct{}{}
+		}
 	}
 
 	return gInfos, results, nil
+}
+
+// hasConflict returns true if current writeSet intersects with processedSet.
+func hasConflict(writeSet, processedSet map[string]struct{}) bool {
+	for k := range writeSet {
+		if _, exists := processedSet[k]; exists {
+			return true
+		}
+	}
+	return false
+}
+
+// extractWriteSet traverses the CacheMultiStore and collects modified keys.
+func extractWriteSet(ms storetypes.CacheMultiStore) map[string]struct{} {
+	ws := make(map[string]struct{})
+
+	cms, ok := ms.(cachemultistore.Store)
+	if !ok {
+		return ws
+	}
+
+	// Iterate through underlying stores
+	for storeKey, cw := range cms.GetStores() {
+		if dk, ok := cw.(interface{ DirtyKeys() [][]byte }); ok {
+			for _, key := range dk.DirtyKeys() {
+				ws[storeKey.Name()+":"+hex.EncodeToString(key)] = struct{}{}
+			}
+		}
+	}
+	return ws
 }
 
 // runMsgs iterates through a list of messages and executes them with the provided

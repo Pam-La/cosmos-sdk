@@ -73,6 +73,15 @@ func NewStore(
 	return NewFromKVStore(dbadapter.Store{DB: db}, stores, keys, traceWriter, traceContext)
 }
 
+// GetStores exposes the underlying cache-wrapped KVStores (used by parallel tx write-set extraction).
+func (cms Store) GetStores() map[types.StoreKey]types.CacheWrap {
+	return cms.stores
+}
+
+func (cms *Store) GetStoresPtr() map[types.StoreKey]types.CacheWrap {
+	return cms.stores
+}
+
 func newCacheMultiStoreFromCMS(cms Store) Store {
 	stores := make(map[types.StoreKey]types.CacheWrapper)
 	for k, v := range cms.stores {
