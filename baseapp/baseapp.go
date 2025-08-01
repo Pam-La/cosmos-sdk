@@ -824,8 +824,17 @@ func (app *BaseApp) deliverBatchTx(txs [][]byte) []*abci.ExecTxResult {
 	gInfos, results, err := app.runBatchTx(execModeFinalize, txs)
 	if err != nil {
 		resultStr = "failed"
-		// add error handling
-		return nil
+		resps = make([]*abci.ExecTxResult, batchSize)
+		for i := range batchSize {
+			resps[i] = sdkerrors.ResponseExecTxResultWithEvents(
+				err,
+				0,   // GasWanted
+				0,   // GasUsed
+				nil, // Events
+				app.trace,
+			)
+		}
+		return resps
 	}
 
 	for i := range batchSize {
@@ -1084,8 +1093,12 @@ func (app *BaseApp) runBatchTx(mode execMode, txs [][]byte) (gInfos []sdk.GasInf
 		return []sdk.GasInfo{}, []*sdk.Result{}, nil
 	}
 
-	// 1. 하나의 baseCtx 생성
-	baseCtx := app.getContextForTx(mode, nil)
+	var baseCtx sdk.Context
+	if mode == execModeFinalize {
+		baseCtx = app.finalizeBlockState.Context()
+	} else {
+		baseCtx = app.getContextForTx(mode, nil)
+	}
 	ms := baseCtx.MultiStore()
 
 	// 병렬 실행 결과를 저장
@@ -1229,7 +1242,6 @@ func (app *BaseApp) runBatchTx(mode execMode, txs [][]byte) (gInfos []sdk.GasInf
 			continue
 		}
 
-		// 메모리풀 처리 (순차적으로)
 		switch mode {
 		case execModeCheck:
 			if err := app.mempool.Insert(txResult.RunMsgCtx, txResult.Tx); err != nil {

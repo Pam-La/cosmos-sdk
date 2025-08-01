@@ -952,14 +952,19 @@ func (app *BaseApp) internalFinalizeBlockWithGroupInfo(ctx context.Context, req 
 	// NOTE: Not all raw transactions may adhere to the sdk.Tx interface, e.g.
 	// vote extensions, so skip those.
 	txResults := make([]*abci.ExecTxResult, 0, len(req.Txs))
-
 	for i := 0; i < len(groupInfo); i++ {
-		group := make([][]byte, 0, len(groupInfo[i]))
-		for _, tx := range groupInfo[i] {
-			group = append(group, req.Txs[tx])
+		if len(groupInfo[i]) == 0 {
+			continue
 		}
 
-		response := app.deliverBatchTx(group)
+		// 🔧 핵심: 그룹 내 트랜잭션을 병렬 실행하되 finalizeBlockState 직접 사용
+		group := make([][]byte, 0, len(groupInfo[i]))
+		for _, txIndex := range groupInfo[i] {
+			group = append(group, req.Txs[txIndex])
+		}
+
+		// 그룹 내 트랜잭션들을 병렬 실행하고 즉시 finalizeBlockState 업데이트
+		groupResponses := app.deliverBatchTx(group)
 
 		select {
 		case <-ctx.Done():
@@ -968,7 +973,7 @@ func (app *BaseApp) internalFinalizeBlockWithGroupInfo(ctx context.Context, req 
 			// continue
 		}
 
-		txResults = append(txResults, response...)
+		txResults = append(txResults, groupResponses...)
 	}
 
 	if app.finalizeBlockState.ms.TracingEnabled() {
@@ -1065,26 +1070,12 @@ func (app *BaseApp) FinalizeBlockWithGroupInfo(req *abci.RequestFinalizeBlock, g
 	}()
 
 	if app.optimisticExec.Initialized() {
-		// check if the hash we got is the same as the one we are executing
-		aborted := app.optimisticExec.AbortIfNeeded(req.Hash)
-		// Wait for the OE to finish, regardless of whether it was aborted or not
-		res, err = app.optimisticExec.WaitResult()
-
-		// only return if we are not aborting
-		if !aborted {
-			if res != nil {
-				res.AppHash = app.workingHash()
-			}
-
-			return res, err
-		}
-
-		// if it was aborted, we need to reset the state
-		app.finalizeBlockState = nil
+		app.optimisticExec.Abort()
 		app.optimisticExec.Reset()
+		app.finalizeBlockState = nil
 	}
 
-	// if no OE is running, just run the block (this is either a block replay or a OE that got aborted)
+	// GroupInfo를 사용한 병렬 처리 실행
 	res, err = app.internalFinalizeBlockWithGroupInfo(context.Background(), req, groupInfo)
 	if res != nil {
 		res.AppHash = app.workingHash()
