@@ -6,6 +6,7 @@ import (
 	"maps"
 	"math"
 	"slices"
+	"sort"
 	"strconv"
 	"sync"
 
@@ -806,6 +807,44 @@ func (app *BaseApp) deliverTx(tx []byte) *abci.ExecTxResult {
 	return resp
 }
 
+func (app *BaseApp) deliverBatchTx(txs [][]byte) []*abci.ExecTxResult {
+	batchSize := len(txs)
+	resultStr := "successful"
+	usedGas, wantedGas := uint64(0), uint64(0)
+
+	var resps []*abci.ExecTxResult
+
+	defer func() {
+		telemetry.IncrCounter(float32(batchSize), "tx", "count")
+		telemetry.IncrCounter(float32(batchSize), "tx", resultStr)
+		telemetry.SetGauge(float32(usedGas), "tx", "gas", "used")
+		telemetry.SetGauge(float32(wantedGas), "tx", "gas", "wanted")
+	}()
+
+	gInfos, results, err := app.runBatchTx(execModeFinalize, txs)
+	if err != nil {
+		resultStr = "failed"
+		// add error handling
+		return nil
+	}
+
+	for i := range batchSize {
+		usedGas += gInfos[i].GasUsed
+		wantedGas += gInfos[i].GasWanted
+
+		resp := &abci.ExecTxResult{
+			GasWanted: int64(gInfos[i].GasWanted),
+			GasUsed:   int64(gInfos[i].GasUsed),
+			Log:       results[i].Log,
+			Data:      results[i].Data,
+			Events:    sdk.MarkEventsToIndex(results[i].Events, app.indexEvents),
+		}
+		resps = append(resps, resp)
+	}
+
+	return resps
+}
+
 // endBlock is an application-defined function that is called after transactions
 // have been processed in FinalizeBlock.
 func (app *BaseApp) endBlock(_ context.Context) (sdk.EndBlock, error) {
@@ -1023,6 +1062,212 @@ func (app *BaseApp) runTx(mode execMode, txBytes []byte, tx sdk.Tx) (gInfo sdk.G
 	}
 
 	return gInfo, result, anteEvents, err
+}
+
+// TxExecutionResult holds the result of executing a single transaction in parallel
+type TxExecutionResult struct {
+	Index      int                        // 트랜잭션 인덱스
+	TxBytes    []byte                     // 원본 트랜잭션 바이트
+	Tx         sdk.Tx                     // 디코딩된 트랜잭션
+	GasInfo    sdk.GasInfo                // 가스 정보
+	Result     *sdk.Result                // 실행 결과
+	AnteEvents []abci.Event               // AnteHandler 이벤트
+	RunMsgCtx  sdk.Context                // 메시지 실행 컨텍스트
+	MsCache    storetypes.CacheMultiStore // 캐시된 멀티스토어
+	Error      error                      // 실행 에러
+	GasWanted  uint64                     // 요청된 가스
+}
+
+func (app *BaseApp) runBatchTx(mode execMode, txs [][]byte) (gInfos []sdk.GasInfo, results []*sdk.Result, err error) {
+	batchSize := len(txs)
+	if batchSize == 0 {
+		return []sdk.GasInfo{}, []*sdk.Result{}, nil
+	}
+
+	// 1. 하나의 baseCtx 생성
+	baseCtx := app.getContextForTx(mode, nil)
+	ms := baseCtx.MultiStore()
+
+	// 병렬 실행 결과를 저장
+	txResults := make([]*TxExecutionResult, batchSize)
+	var wg sync.WaitGroup
+
+	// 2. 각 트랜잭션을 병렬로 실행 (write하지 않음)
+	for i, txBytes := range txs {
+		wg.Add(1)
+		go func(index int, txBytes []byte) {
+			defer wg.Done()
+
+			result := &TxExecutionResult{
+				Index:   index,
+				TxBytes: txBytes,
+			}
+
+			defer func() {
+				if r := recover(); r != nil {
+					result.Error = fmt.Errorf("panic in parallel tx execution: %v", r)
+				}
+				txResults[index] = result
+			}()
+
+			tx, err := app.txDecoder(txBytes)
+			if err != nil {
+				result.Error = sdkerrors.ErrTxDecode.Wrap(err.Error())
+				return
+			}
+			result.Tx = tx
+
+			if mode == execModeFinalize && baseCtx.BlockGasMeter().IsOutOfGas() {
+				result.Error = errorsmod.Wrap(sdkerrors.ErrOutOfGas, "no block gas left to run tx")
+				return
+			}
+
+			// baseCtx 기반으로 독립 트랜잭션 컨텍스트 생성
+			ctx := baseCtx.WithTxBytes(txBytes).
+				WithGasMeter(storetypes.NewInfiniteGasMeter()).
+				WithIsSigverifyTx(app.sigverifyTx).
+				WithConsensusParams(app.GetConsensusParams(baseCtx))
+
+			if mode == execModeReCheck {
+				ctx = ctx.WithIsReCheckTx(true)
+			}
+			if mode == execModeSimulate {
+				ctx, _ = ctx.CacheContext()
+				ctx = ctx.WithExecMode(sdk.ExecMode(execModeSimulate))
+			}
+
+			var gasWanted uint64
+
+			msgs := tx.GetMsgs()
+			if err := validateBasicTxMsgs(msgs); err != nil {
+				result.Error = err
+				return
+			}
+
+			for _, msg := range msgs {
+				handler := app.msgServiceRouter.Handler(msg)
+				if handler == nil {
+					result.Error = errorsmod.Wrapf(sdkerrors.ErrUnknownRequest, "no message handler found for %T", msg)
+					return
+				}
+			}
+
+			var anteEvents []abci.Event
+			if app.anteHandler != nil {
+				anteCtx, anteMsCache := app.cacheTxContext(ctx, txBytes)
+				anteCtx = anteCtx.WithEventManager(sdk.NewEventManager())
+
+				newCtx, err := app.anteHandler(anteCtx, tx, mode == execModeSimulate)
+				if !newCtx.IsZero() {
+					ctx = newCtx.WithMultiStore(ms)
+				}
+
+				gasWanted = ctx.GasMeter().Limit()
+				if err != nil {
+					result.Error = err
+					result.GasInfo = sdk.GasInfo{GasWanted: gasWanted, GasUsed: ctx.GasMeter().GasConsumed()}
+					return
+				}
+
+				anteMsCache.Write()
+				events := anteCtx.EventManager().Events()
+				anteEvents = events.ToABCIEvents()
+			}
+
+			// 3. runMsgCtx 생성 (write하지 않음)
+			runMsgCtx, msCache := app.cacheTxContext(ctx, txBytes)
+
+			msgsV2, err := tx.GetMsgsV2()
+			var msgResult *sdk.Result
+			if err == nil {
+				msgResult, err = app.runMsgs(runMsgCtx, msgs, msgsV2, mode)
+			}
+
+			if app.postHandler != nil && err == nil {
+				postCtx := runMsgCtx.WithEventManager(sdk.NewEventManager())
+				newCtx, errPostHandler := app.postHandler(postCtx, tx, mode == execModeSimulate, err == nil)
+				if errPostHandler != nil {
+					result.Error = errPostHandler
+					return
+				}
+				if msgResult == nil {
+					msgResult = &sdk.Result{}
+				}
+				msgResult.Events = append(msgResult.Events, newCtx.EventManager().ABCIEvents()...)
+			}
+
+			// 결과 저장 (write는 하지 않음)
+			result.GasWanted = gasWanted
+			result.GasInfo = sdk.GasInfo{GasWanted: gasWanted, GasUsed: ctx.GasMeter().GasConsumed()}
+			result.Result = msgResult
+			result.AnteEvents = anteEvents
+			result.RunMsgCtx = runMsgCtx
+			result.MsCache = msCache
+			result.Error = err
+		}(i, txBytes)
+	}
+
+	// 모든 고루틴 완료 대기
+	wg.Wait()
+
+	// 트랜잭션 인덱스 순으로 정렬
+	sort.Slice(txResults, func(i, j int) bool {
+		return txResults[i].Index < txResults[j].Index
+	})
+
+	// 4. 순차적으로 write 및 결과 취합
+	gInfos = make([]sdk.GasInfo, batchSize)
+	results = make([]*sdk.Result, batchSize)
+
+	for _, txResult := range txResults {
+		index := txResult.Index
+
+		if txResult.Error != nil {
+			// 에러가 있는 경우
+			gInfos[index] = txResult.GasInfo
+			results[index] = &sdk.Result{}
+			continue
+		}
+
+		// 메모리풀 처리 (순차적으로)
+		switch mode {
+		case execModeCheck:
+			if err := app.mempool.Insert(txResult.RunMsgCtx, txResult.Tx); err != nil {
+				gInfos[index] = txResult.GasInfo
+				results[index] = &sdk.Result{}
+				continue
+			}
+		case execModeFinalize:
+			if err := app.mempool.Remove(txResult.Tx); err != nil && !errors.Is(err, mempool.ErrTxNotFound) {
+				gInfos[index] = txResult.GasInfo
+				results[index] = &sdk.Result{}
+				continue
+			}
+		}
+
+		// 성공한 경우에만 write
+		if mode == execModeFinalize {
+			// 블록 가스 소비
+			baseCtx.BlockGasMeter().ConsumeGas(
+				txResult.RunMsgCtx.GasMeter().GasConsumedToLimit(), "block gas meter",
+			)
+
+			// 상태 write
+			txResult.MsCache.Write()
+		}
+
+		// 이벤트 병합
+		if len(txResult.AnteEvents) > 0 && (mode == execModeFinalize || mode == execModeSimulate) {
+			if txResult.Result != nil {
+				txResult.Result.Events = append(txResult.AnteEvents, txResult.Result.Events...)
+			}
+		}
+
+		gInfos[index] = txResult.GasInfo
+		results[index] = txResult.Result
+	}
+
+	return gInfos, results, nil
 }
 
 // runMsgs iterates through a list of messages and executes them with the provided
