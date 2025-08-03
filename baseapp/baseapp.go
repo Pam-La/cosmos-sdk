@@ -844,6 +844,11 @@ func (app *BaseApp) deliverBatchTx(txs [][]byte) []*abci.ExecTxResult {
 		usedGas += gInfos[i].GasUsed
 		wantedGas += gInfos[i].GasWanted
 
+		// deliverBatchTx 루프
+		if results[i] == nil {
+			results[i] = &sdk.Result{}
+		}
+
 		resp := &abci.ExecTxResult{
 			GasWanted: int64(gInfos[i].GasWanted),
 			GasUsed:   int64(gInfos[i].GasUsed),
@@ -1313,6 +1318,9 @@ func (app *BaseApp) commitBatchResults(
 			}
 		}
 
+		if txResult.Result == nil {
+			txResult.Result = &sdk.Result{}
+		}
 		gInfos[idx] = txResult.GasInfo
 		results[idx] = txResult.Result
 
